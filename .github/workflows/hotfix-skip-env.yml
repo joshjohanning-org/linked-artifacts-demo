@@ -167,4 +167,4 @@ jobs:
             -f status="deployed" \
             -f logical_environment="$LOGICAL_ENV" \
             -f deployment_name="hotfix-deploy-${{ github.run_number }}" \
-            -f github_repository="${{ github.repository }}"
+            -f github_repository="${{ github.event.repository.name }}"

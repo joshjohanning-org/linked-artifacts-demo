@@ -121,7 +121,7 @@ jobs:
             -f status="deployed" \
             -f logical_environment="development" \
             -f deployment_name="dev-deploy-${{ github.run_number }}" \
-            -f github_repository="${{ github.repository }}"
+            -f github_repository="${{ github.event.repository.name }}"
           echo "✅ Deployment record registered for Dev"
 
       - name: 📋 Dev deployment summary
@@ -182,7 +182,7 @@ jobs:
             -f status="deployed" \
             -f logical_environment="testing" \
             -f deployment_name="qa-deploy-${{ github.run_number }}" \
-            -f github_repository="${{ github.repository }}"
+            -f github_repository="${{ github.event.repository.name }}"
           echo "✅ Deployment record registered for QA"
 
       - name: 📋 QA deployment summary
@@ -243,7 +243,7 @@ jobs:
             -f status="deployed" \
             -f logical_environment="staging" \
             -f deployment_name="staging-deploy-${{ github.run_number }}" \
-            -f github_repository="${{ github.repository }}"
+            -f github_repository="${{ github.event.repository.name }}"
           echo "✅ Deployment record registered for Staging"
 
       - name: 📋 Staging deployment summary
@@ -300,7 +300,7 @@ jobs:
           jq -n \
             --arg name "${{ env.APP_NAME }}" \
             --arg digest "${{ needs.build.outputs.digest }}" \
-            --arg repo "${{ github.repository }}" \
+            --arg repo "${{ github.event.repository.name }}" \
             --arg deploy_name "prod-deploy-${{ github.run_number }}" \
             '{
               name: $name,
