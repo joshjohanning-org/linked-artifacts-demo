@@ -1,0 +1,333 @@
+###############################################################################
+# build-and-deploy.yml
+#
+# End-to-end CI/CD pipeline demonstrating GitHub Linked Artifacts.
+#
+# 1. Builds a Docker image and pushes to GHCR
+# 2. Generates a signed provenance attestation (auto-creates storage record)
+# 3. Deploys through 4 environments: Dev → QA → Staging → Production
+# 4. Each promotion step verifies the artifact was deployed to the prior
+#    environment by querying the Linked Artifacts API
+# 5. Registers a deployment record after each successful deployment
+###############################################################################
+
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  APP_NAME: linked-artifacts-demo
+
+permissions: {}
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BUILD — Build Docker image, push to GHCR, attest provenance
+  # ═══════════════════════════════════════════════════════════════════════════
+  build:
+    name: 🔨 Build & Attest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      image: ${{ env.IMAGE_NAME }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: 📋 Build summary
+        run: |
+          echo "## 🔨 Build Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Image** | \`${{ env.IMAGE_NAME }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Digest** | \`${{ steps.push.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Tags** | \`${{ github.sha }}\`, \`latest\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Attestation** | ✅ Signed provenance |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Storage Record** | ✅ Auto-created via attest action |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEPLOY TO DEV — First environment, no verification gate needed
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-dev:
+    name: 🚀 Deploy to Dev
+    needs: build
+    runs-on: ubuntu-latest
+    environment: Dev
+    permissions:
+      contents: read
+      artifact-metadata: write
+    steps:
+      - name: Simulate deployment to Dev
+        run: |
+          echo "═══════════════════════════════════════════════"
+          echo "  Deploying to Dev environment"
+          echo "  Image: ${{ needs.build.outputs.image }}:${{ github.sha }}"
+          echo "  Digest: ${{ needs.build.outputs.digest }}"
+          echo "═══════════════════════════════════════════════"
+          echo ""
+          echo "🐳 docker pull ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}"
+          echo "🚀 Deploying container..."
+          sleep 2
+          echo "✅ Deployment to Dev complete!"
+
+      - name: Register deployment record (Dev)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📝 Registering deployment record for Dev..."
+          gh api -X POST \
+            "orgs/${{ github.repository_owner }}/artifacts/metadata/deployment-record" \
+            -f name="${{ env.APP_NAME }}" \
+            -f digest="${{ needs.build.outputs.digest }}" \
+            -f status="deployed" \
+            -f logical_environment="development" \
+            -f deployment_name="dev-deploy-${{ github.run_number }}" \
+            -f github_repository="${{ github.repository }}"
+          echo "✅ Deployment record registered for Dev"
+
+      - name: 📋 Dev deployment summary
+        run: |
+          echo "## 🚀 Deployed to Dev" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Environment** | Dev (\`development\`) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Digest** | \`${{ needs.build.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Deployment Record** | ✅ Registered |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Verification Gate** | N/A (first environment) |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEPLOY TO QA — Verifies Dev deployment exists before proceeding
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-qa:
+    name: 🚀 Deploy to QA
+    needs: [build, deploy-dev]
+    runs-on: ubuntu-latest
+    environment: QA
+    permissions:
+      contents: read
+      artifact-metadata: write
+    steps:
+      - name: Checkout (for verification script)
+        uses: actions/checkout@v4
+
+      - name: "🔒 Verify: Dev deployment exists"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x .github/scripts/verify-deployment.sh
+          .github/scripts/verify-deployment.sh \
+            "${{ github.repository_owner }}" \
+            "${{ needs.build.outputs.digest }}" \
+            "development"
+
+      - name: Simulate deployment to QA
+        run: |
+          echo "═══════════════════════════════════════════════"
+          echo "  Deploying to QA environment"
+          echo "  Image: ${{ needs.build.outputs.image }}:${{ github.sha }}"
+          echo "  Digest: ${{ needs.build.outputs.digest }}"
+          echo "═══════════════════════════════════════════════"
+          sleep 2
+          echo "✅ Deployment to QA complete!"
+
+      - name: Register deployment record (QA)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📝 Registering deployment record for QA..."
+          gh api -X POST \
+            "orgs/${{ github.repository_owner }}/artifacts/metadata/deployment-record" \
+            -f name="${{ env.APP_NAME }}" \
+            -f digest="${{ needs.build.outputs.digest }}" \
+            -f status="deployed" \
+            -f logical_environment="testing" \
+            -f deployment_name="qa-deploy-${{ github.run_number }}" \
+            -f github_repository="${{ github.repository }}"
+          echo "✅ Deployment record registered for QA"
+
+      - name: 📋 QA deployment summary
+        run: |
+          echo "## 🚀 Deployed to QA" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Environment** | QA (\`testing\`) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Digest** | \`${{ needs.build.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Deployment Record** | ✅ Registered |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Verification Gate** | ✅ Dev deployment confirmed |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEPLOY TO STAGING — Verifies QA deployment exists before proceeding
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    needs: [build, deploy-qa]
+    runs-on: ubuntu-latest
+    environment: Staging
+    permissions:
+      contents: read
+      artifact-metadata: write
+    steps:
+      - name: Checkout (for verification script)
+        uses: actions/checkout@v4
+
+      - name: "🔒 Verify: QA deployment exists"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x .github/scripts/verify-deployment.sh
+          .github/scripts/verify-deployment.sh \
+            "${{ github.repository_owner }}" \
+            "${{ needs.build.outputs.digest }}" \
+            "testing"
+
+      - name: Simulate deployment to Staging
+        run: |
+          echo "═══════════════════════════════════════════════"
+          echo "  Deploying to Staging environment"
+          echo "  Image: ${{ needs.build.outputs.image }}:${{ github.sha }}"
+          echo "  Digest: ${{ needs.build.outputs.digest }}"
+          echo "═══════════════════════════════════════════════"
+          sleep 2
+          echo "✅ Deployment to Staging complete!"
+
+      - name: Register deployment record (Staging)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📝 Registering deployment record for Staging..."
+          gh api -X POST \
+            "orgs/${{ github.repository_owner }}/artifacts/metadata/deployment-record" \
+            -f name="${{ env.APP_NAME }}" \
+            -f digest="${{ needs.build.outputs.digest }}" \
+            -f status="deployed" \
+            -f logical_environment="staging" \
+            -f deployment_name="staging-deploy-${{ github.run_number }}" \
+            -f github_repository="${{ github.repository }}"
+          echo "✅ Deployment record registered for Staging"
+
+      - name: 📋 Staging deployment summary
+        run: |
+          echo "## 🚀 Deployed to Staging" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Environment** | Staging (\`staging\`) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Digest** | \`${{ needs.build.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Deployment Record** | ✅ Registered |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Verification Gate** | ✅ QA deployment confirmed |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEPLOY TO PRODUCTION — Verifies Staging deployment + environment approval
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-prod:
+    name: 🚀 Deploy to Production
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: Production
+    permissions:
+      contents: read
+      artifact-metadata: write
+    steps:
+      - name: Checkout (for verification script)
+        uses: actions/checkout@v4
+
+      - name: "🔒 Verify: Staging deployment exists"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x .github/scripts/verify-deployment.sh
+          .github/scripts/verify-deployment.sh \
+            "${{ github.repository_owner }}" \
+            "${{ needs.build.outputs.digest }}" \
+            "staging"
+
+      - name: Simulate deployment to Production
+        run: |
+          echo "═══════════════════════════════════════════════"
+          echo "  🏭 Deploying to Production environment"
+          echo "  Image: ${{ needs.build.outputs.image }}:${{ github.sha }}"
+          echo "  Digest: ${{ needs.build.outputs.digest }}"
+          echo "═══════════════════════════════════════════════"
+          sleep 2
+          echo "✅ Deployment to Production complete!"
+
+      - name: Register deployment record (Production)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📝 Registering deployment record for Production..."
+          jq -n \
+            --arg name "${{ env.APP_NAME }}" \
+            --arg digest "${{ needs.build.outputs.digest }}" \
+            --arg repo "${{ github.repository }}" \
+            --arg deploy_name "prod-deploy-${{ github.run_number }}" \
+            '{
+              name: $name,
+              digest: $digest,
+              status: "deployed",
+              logical_environment: "production",
+              deployment_name: $deploy_name,
+              runtime_risks: ["internet-exposed"],
+              github_repository: $repo
+            }' | gh api -X POST \
+            "orgs/${{ github.repository_owner }}/artifacts/metadata/deployment-record" \
+            --input -
+          echo "✅ Deployment record registered for Production"
+
+      - name: 📋 Production deployment summary
+        run: |
+          echo "## 🏭 Deployed to Production" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Environment** | Production (\`production\`) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Digest** | \`${{ needs.build.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Deployment Record** | ✅ Registered |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Verification Gate** | ✅ Staging deployment confirmed |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Runtime Risks** | \`internet-exposed\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 🎉 Full Pipeline Complete!" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "View this artifact on the **Linked Artifacts** page:" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Org → Packages → Linked artifacts**" >> "$GITHUB_STEP_SUMMARY"
