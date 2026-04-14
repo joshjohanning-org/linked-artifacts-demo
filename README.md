@@ -40,14 +40,21 @@ Find it at: **Organization → Packages tab → Linked artifacts** (left sidebar
   record)
 ```
 
-### Two Workflows
+### Three Workflows
 
-#### 1. `build-and-deploy.yml` — Happy Path
+#### 1. `build-and-deploy.yml` — Docker Container (Happy Path)
 Triggered on push to `main`. Builds a Docker image, pushes to GHCR, attests provenance, then deploys sequentially through all 4 environments. Each promotion step:
 - **Verifies** the artifact was deployed to the prior environment (via Linked Artifacts API)
 - **Registers** a deployment record after successful deployment
 
-#### 2. `hotfix-skip-env.yml` — Negative Test ❌
+#### 2. `build-and-deploy-dotnet.yml` — .NET File Artifact (Happy Path) 📄
+Same promotion flow, but with a **ZIP file instead of a container**. This demonstrates that linked artifacts works with any hashable build output. Key differences:
+- Digest is computed by hashing the ZIP file (`sha256sum`)
+- Attestation uses `subject-path` instead of `subject-name`/`subject-digest`
+- Storage record is registered **manually** via REST API (no auto-creation for files)
+- Artifact is stored as a GitHub Actions artifact, not in a registry
+
+#### 3. `hotfix-skip-env.yml` — Negative Test ❌
 Manually triggered. Builds a **new** image and tries to deploy it directly to a higher environment (e.g., Staging), skipping the lower ones. The verification gate **blocks** this because no prior deployment records exist for the new image's digest.
 
 This proves the enforcement isn't just `needs:` job ordering — it's the real API check.
@@ -56,7 +63,16 @@ This proves the enforcement isn't just `needs:` job ordering — it's the real A
 
 ### 1. Build & Attest
 
-The build job pushes a Docker image to GHCR and generates a [signed provenance attestation](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) using `actions/attest`. With `push-to-registry: true` and `artifact-metadata: write` permission, this **automatically creates a storage record** on the linked artifacts page.
+**Container (Docker):** The build job pushes a Docker image to GHCR and generates a [signed provenance attestation](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) using `actions/attest`. With `push-to-registry: true` and `artifact-metadata: write` permission, this **automatically creates a storage record** on the linked artifacts page.
+
+**.NET (File):** The build job publishes the app, zips it, computes a `sha256` hash, attests using `subject-path`, and **manually registers a storage record** via REST API. This shows linked artifacts works without a container registry.
+
+| | Container (Docker) | File (.NET ZIP) |
+|---|---|---|
+| **Digest source** | Registry provides it automatically | Hash the file with `sha256sum` |
+| **Attestation** | `subject-name` + `subject-digest` + `push-to-registry: true` | `subject-path` |
+| **Storage record** | Auto-created by `actions/attest` | Manual `POST` to REST API |
+| **Artifact storage** | GHCR | GitHub Actions artifact |
 
 ### 2. Deployment Records
 
@@ -154,11 +170,16 @@ After the pipeline completes:
 │   ├── scripts/
 │   │   └── verify-deployment.sh       # Reusable verification gate
 │   └── workflows/
-│       ├── build-and-deploy.yml       # Main CI/CD pipeline (happy path)
+│       ├── build-and-deploy.yml       # Docker container pipeline
+│       ├── build-and-deploy-dotnet.yml # .NET file artifact pipeline
 │       └── hotfix-skip-env.yml        # Negative test (skip environments)
 ├── src/
-│   └── index.js                       # Simple Express.js app
-├── Dockerfile                         # Multi-stage Docker build
+│   └── index.js                       # Simple Express.js app (Docker demo)
+├── dotnet-app/                        # .NET Web API app (file artifact demo)
+│   ├── Program.cs
+│   ├── dotnet-app.csproj
+│   └── ...
+├── Dockerfile                         # Docker build for Node.js app
 ├── package.json
 └── README.md
 ```

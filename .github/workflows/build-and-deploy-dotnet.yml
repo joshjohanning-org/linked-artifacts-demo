@@ -1,0 +1,356 @@
+###############################################################################
+# build-and-deploy-dotnet.yml
+#
+# Demonstrates Linked Artifacts with a FILE-BASED artifact (not a container).
+#
+# This workflow:
+# 1. Builds a .NET app and publishes it as a ZIP file
+# 2. Hashes the ZIP to produce a stable digest
+# 3. Attests the file using actions/attest with subject-path
+# 4. Manually registers a storage record (no auto-creation for files)
+# 5. Deploys through 4 environments with verification gates
+# 6. Registers deployment records at each stage
+#
+# This shows that Linked Artifacts works with ANY hashable build output —
+# you don't need Docker containers or a package registry.
+###############################################################################
+
+name: "Build and Deploy (.NET)"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dotnet-app/**'
+      - '.github/workflows/build-and-deploy-dotnet.yml'
+      - '.github/scripts/**'
+  workflow_dispatch:
+
+env:
+  APP_NAME: linked-artifacts-demo-dotnet
+  DOTNET_VERSION: "9.0.x"
+
+permissions: {}
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BUILD — Build .NET app, publish as ZIP, hash it, attest, register storage
+  # ═══════════════════════════════════════════════════════════════════════════
+  build:
+    name: 🔨 Build & Attest (.NET)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      digest: ${{ steps.hash.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+      artifact-name: ${{ env.APP_NAME }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build and publish
+        run: |
+          dotnet publish dotnet-app/ \
+            --configuration Release \
+            --output ./publish \
+            --self-contained false
+
+      - name: Create ZIP artifact
+        run: |
+          cd publish
+          zip -r ../linked-artifacts-demo-dotnet.zip .
+          cd ..
+          echo "📦 Artifact created:"
+          ls -lh linked-artifacts-demo-dotnet.zip
+
+      - name: Generate artifact hash
+        id: hash
+        run: |
+          DIGEST="sha256:$(sha256sum linked-artifacts-demo-dotnet.zip | awk '{print $1}')"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "📋 Artifact digest: $DIGEST"
+
+      - name: Set version
+        id: version
+        run: echo "version=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}
+          path: linked-artifacts-demo-dotnet.zip
+          retention-days: 30
+
+      # ── Attest the file (subject-path for files, not subject-name/digest) ──
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: linked-artifacts-demo-dotnet.zip
+          subject-name: ${{ env.APP_NAME }}
+
+      # ── Manually register storage record (no auto-creation for files) ──
+      - name: Register storage record
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📝 Registering storage record..."
+          gh api -X POST \
+            "orgs/${{ github.repository_owner }}/artifacts/metadata/storage-record" \
+            -f name="${{ env.APP_NAME }}" \
+            -f digest="${{ steps.hash.outputs.digest }}" \
+            -f version="${{ steps.version.outputs.version }}" \
+            -f registry_url="https://github.com" \
+            -f repository="${{ github.event.repository.name }}" \
+            -f artifact_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f status="active" \
+            -f github_repository="${{ github.event.repository.name }}"
+          echo "✅ Storage record registered"
+
+      - name: 📋 Build summary
+        run: |
+          echo "## 🔨 .NET Build Complete (File Artifact)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Artifact** | \`${{ env.APP_NAME }}.zip\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Digest** | \`${{ steps.hash.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Version** | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Attestation** | ✅ Signed provenance (file-based) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Storage Record** | ✅ Manually registered |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> **Note:** Unlike container images, file artifacts require manual" >> "$GITHUB_STEP_SUMMARY"
+          echo "> storage record registration via the REST API." >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEPLOY TO DEV
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-dev:
+    name: 🚀 Deploy to Dev (.NET)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: Dev
+    permissions:
+      contents: read
+      artifact-metadata: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}
+
+      - name: Simulate deployment to Dev
+        run: |
+          echo "═══════════════════════════════════════════════"
+          echo "  Deploying .NET app to Dev environment"
+          echo "  Artifact: ${{ env.APP_NAME }}.zip"
+          echo "  Digest:   ${{ needs.build.outputs.digest }}"
+          echo "═══════════════════════════════════════════════"
+          echo ""
+          echo "📦 Extracting artifact..."
+          ls -lh *.zip
+          echo "🚀 Deploying to Dev server..."
+          sleep 2
+          echo "✅ Deployment to Dev complete!"
+
+      - name: Register deployment record (Dev)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST \
+            "orgs/${{ github.repository_owner }}/artifacts/metadata/deployment-record" \
+            -f name="${{ env.APP_NAME }}" \
+            -f digest="${{ needs.build.outputs.digest }}" \
+            -f status="deployed" \
+            -f logical_environment="development" \
+            -f deployment_name="dotnet-dev-deploy-${{ github.run_number }}" \
+            -f github_repository="${{ github.event.repository.name }}"
+          echo "✅ Deployment record registered for Dev"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEPLOY TO QA — Verifies Dev deployment exists
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-qa:
+    name: 🚀 Deploy to QA (.NET)
+    needs: [build, deploy-dev]
+    runs-on: ubuntu-latest
+    environment: QA
+    permissions:
+      contents: read
+      artifact-metadata: write
+    steps:
+      - name: Checkout (for verification script)
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}
+
+      - name: "🔒 Verify: Dev deployment exists"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x .github/scripts/verify-deployment.sh
+          .github/scripts/verify-deployment.sh \
+            "${{ github.repository_owner }}" \
+            "${{ needs.build.outputs.digest }}" \
+            "development"
+
+      - name: Simulate deployment to QA
+        run: |
+          echo "🚀 Deploying .NET app to QA..."
+          sleep 2
+          echo "✅ Deployment to QA complete!"
+
+      - name: Register deployment record (QA)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST \
+            "orgs/${{ github.repository_owner }}/artifacts/metadata/deployment-record" \
+            -f name="${{ env.APP_NAME }}" \
+            -f digest="${{ needs.build.outputs.digest }}" \
+            -f status="deployed" \
+            -f logical_environment="testing" \
+            -f deployment_name="dotnet-qa-deploy-${{ github.run_number }}" \
+            -f github_repository="${{ github.event.repository.name }}"
+          echo "✅ Deployment record registered for QA"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEPLOY TO STAGING — Verifies QA deployment exists
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: 🚀 Deploy to Staging (.NET)
+    needs: [build, deploy-qa]
+    runs-on: ubuntu-latest
+    environment: Staging
+    permissions:
+      contents: read
+      artifact-metadata: write
+    steps:
+      - name: Checkout (for verification script)
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}
+
+      - name: "🔒 Verify: QA deployment exists"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x .github/scripts/verify-deployment.sh
+          .github/scripts/verify-deployment.sh \
+            "${{ github.repository_owner }}" \
+            "${{ needs.build.outputs.digest }}" \
+            "testing"
+
+      - name: Simulate deployment to Staging
+        run: |
+          echo "🚀 Deploying .NET app to Staging..."
+          sleep 2
+          echo "✅ Deployment to Staging complete!"
+
+      - name: Register deployment record (Staging)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST \
+            "orgs/${{ github.repository_owner }}/artifacts/metadata/deployment-record" \
+            -f name="${{ env.APP_NAME }}" \
+            -f digest="${{ needs.build.outputs.digest }}" \
+            -f status="deployed" \
+            -f logical_environment="staging" \
+            -f deployment_name="dotnet-staging-deploy-${{ github.run_number }}" \
+            -f github_repository="${{ github.event.repository.name }}"
+          echo "✅ Deployment record registered for Staging"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEPLOY TO PRODUCTION — Verifies Staging deployment + environment approval
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-prod:
+    name: 🚀 Deploy to Production (.NET)
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: Production
+    permissions:
+      contents: read
+      artifact-metadata: write
+    steps:
+      - name: Checkout (for verification script)
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}
+
+      - name: "🔒 Verify: Staging deployment exists"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x .github/scripts/verify-deployment.sh
+          .github/scripts/verify-deployment.sh \
+            "${{ github.repository_owner }}" \
+            "${{ needs.build.outputs.digest }}" \
+            "staging"
+
+      - name: Simulate deployment to Production
+        run: |
+          echo "🏭 Deploying .NET app to Production..."
+          sleep 2
+          echo "✅ Deployment to Production complete!"
+
+      - name: Register deployment record (Production)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          jq -n \
+            --arg name "${{ env.APP_NAME }}" \
+            --arg digest "${{ needs.build.outputs.digest }}" \
+            --arg repo "${{ github.event.repository.name }}" \
+            --arg deploy_name "dotnet-prod-deploy-${{ github.run_number }}" \
+            '{
+              name: $name,
+              digest: $digest,
+              status: "deployed",
+              logical_environment: "production",
+              deployment_name: $deploy_name,
+              runtime_risks: ["internet-exposed", "sensitive-data"],
+              github_repository: $repo
+            }' | gh api -X POST \
+            "orgs/${{ github.repository_owner }}/artifacts/metadata/deployment-record" \
+            --input -
+          echo "✅ Deployment record registered for Production"
+
+      - name: 📋 Full pipeline summary
+        run: |
+          echo "## 🏭 .NET App — Full Pipeline Complete!" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Artifact Type** | 📄 ZIP file (not a container!) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Artifact** | \`${{ env.APP_NAME }}.zip\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Digest** | \`${{ needs.build.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Environments** | Dev ✅ → QA ✅ → Staging ✅ → Production ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Runtime Risks** | \`internet-exposed\`, \`sensitive-data\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Key Difference from Container Demo" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | Container (Docker) | File (.NET ZIP) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Digest source** | Registry provides it | We hash the ZIP ourselves |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Attestation** | \`subject-name\` + \`subject-digest\` | \`subject-path\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Storage record** | Auto-created by \`actions/attest\` | Manual REST API call |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Artifact storage** | GHCR / external registry | GitHub Actions artifact |" >> "$GITHUB_STEP_SUMMARY"
